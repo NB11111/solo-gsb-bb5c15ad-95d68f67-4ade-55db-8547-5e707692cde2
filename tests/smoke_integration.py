@@ -119,4 +119,63 @@ old_review = db.get_review(old_rid)
 assert old_review["result"]["label_check"]["missing_sources"]["坚果"] == \
     [["巧克力酱", "椰子粉"]]
 print(f"5. 审查记录入库 (#{rid}) 与 HTML/Markdown 报告导出 OK；旧记录回填 OK")
+
+# 6. 字典时效复核：指纹保存、无关变化不误报、涉及映射变化才失效
+from app.recheck import (build_result, diff_results, involved_keys,
+                         reparse_review, scoped_fingerprint)
+
+review = db.get_review(rid)
+fp = review["dict_fingerprint"]
+assert fp and not review["needs_review"] and not review["legacy"]
+assert scoped_fingerprint(dictionary, involved_keys(TEXT_A, TEXT_B)) == fp
+# 字典顺序无关：重排后指纹一致
+reordered = {k: dictionary[k] for k in reversed(list(dictionary))}
+assert scoped_fingerprint(reordered, involved_keys(TEXT_A, TEXT_B)) == fp
+# 无关原料增删改、重复导入不使记录失效
+db.upsert_entry("无关花生酱", ["花生"])
+db.upsert_entry("无关花生酱", ["花生", "坚果"])
+db.delete_entry("无关花生酱")
+db.bulk_import("食盐：\n鸡蛋：蛋类\n")
+assert db.get_review(rid)["needs_review"] is False
+# 未识别原料（白砂糖）补登为空过敏原：映射仍为空集，不失效
+db.upsert_entry("白砂糖", [])
+assert db.get_review(rid)["needs_review"] is False
+# 涉及原料映射变化（可可脂新增亚硫酸盐，A/B 均含）才标“需复核”
+db.upsert_entry("可可脂", ["亚硫酸盐"])
+assert db.get_review(rid)["needs_review"] is True
+item = next(r for r in db.list_reviews() if r["id"] == rid)
+assert item["needs_review"] is True and item["legacy"] is False
+print("6. 字典指纹：顺序/无关变化不误报，涉及原料映射变化才需复核 OK")
+
+# 7. 一键复核：先预览前后差异（遗漏/多报/来源路径），确认后覆盖并更新指纹
+stale = db.get_review(rid)
+new_result = reparse_review(stale, db.dict_lookup())
+diff = diff_results(stale["result"], new_result)
+assert "亚硫酸盐" in diff["missing"]["added"]
+assert diff["sources"]["亚硫酸盐"]["added"] == [["巧克力酱", "可可脂"]]
+assert diff["versions"]["a"]["allergens"]["added"] == ["亚硫酸盐"]
+assert diff["versions"]["b"]["allergens"]["added"] == ["亚硫酸盐"]
+new_fp = scoped_fingerprint(db.dict_lookup(), involved_keys(TEXT_A, TEXT_B))
+db.update_review_result(rid, new_result, new_fp)
+fixed = db.get_review(rid)
+assert fixed["needs_review"] is False and fixed["rechecked_at"]
+assert fixed["dict_fingerprint"] == new_fp != fp
+assert "亚硫酸盐" in fixed["result"]["label_check"]["missing"]
+assert render_html_report(fixed).count("字典指纹") == 1
+print("7. 一键复核：差异预览（遗漏/来源路径）+ 确认覆盖/更新指纹 OK")
+
+# 8. 旧记录无指纹：按需复核，确认后补获指纹
+with db._connect() as conn:
+    conn.execute("UPDATE reviews SET dict_fingerprint = NULL, rechecked_at = NULL WHERE id = ?", (rid,))
+legacy = db.get_review(rid)
+assert legacy["needs_review"] is True and legacy["legacy"] is True
+new_result = reparse_review(legacy, db.dict_lookup())
+db.update_review_result(rid, new_result,
+                        scoped_fingerprint(db.dict_lookup(),
+                                           involved_keys(TEXT_A, TEXT_B)))
+assert db.get_review(rid)["needs_review"] is False
+# 报告导出在复核后仍可用
+assert "标签遗漏" in render_html_report(db.get_review(rid))
+print("8. 无指纹旧记录按需复核并补获指纹 OK")
+
 print("\n全部集成冒烟测试通过 ✔")

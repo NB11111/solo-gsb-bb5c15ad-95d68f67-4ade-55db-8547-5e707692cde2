@@ -127,6 +127,23 @@ def change_text(change: dict) -> str:
     return "；".join(parts)
 
 
+def _dict_freshness_meta(review: dict) -> str:
+    """字典时效状态行（有指纹或复核时间时展示）。"""
+    fp = review.get("dict_fingerprint")
+    rechecked = review.get("rechecked_at")
+    if not fp and not rechecked:
+        return ""
+    parts = []
+    if fp:
+        parts.append(f"字典指纹：<code>{_esc(fp)}</code>")
+    if rechecked:
+        parts.append(f"最近复核：{_esc(rechecked)}")
+    if review.get("needs_review"):
+        tip = "该记录基于旧版字典生成且涉及原料映射已变化，建议在系统中执行时效复核"
+        parts.append(f'<span class="warn">⚠ {tip}</span>')
+    return "<br>　　" + "　".join(parts)
+
+
 def render_html_report(review: dict) -> str:
     result = review["result"]
     checked = result.get("label_check_version", review["label_a"])
@@ -158,6 +175,7 @@ def render_html_report(review: dict) -> str:
  .none {{ color: #999; }}
  ul {{ line-height: 1.9; }}
  .meta {{ color: #666; }}
+ .meta code {{ background: #f4f6f8; padding: 0 4px; border-radius: 4px; }}
  .miss-item {{ margin: 4px 0; }}
  details.src {{ margin: 2px 0 4px; }}
  details.src summary {{ cursor: pointer; color: #777; font-size: .85em; }}
@@ -168,7 +186,8 @@ def render_html_report(review: dict) -> str:
 </style></head><body>
 <h1>食品过敏原标签审查报告</h1>
 <p class="meta">审查名称：<b>{_esc(review['name'])}</b>
-   生成时间：{_esc(review['created_at'])}　报告编号：#{review['id']}</p>
+   生成时间：{_esc(review['created_at'])}　报告编号：#{review['id']}
+   {_dict_freshness_meta(review)}</p>
 
 <h2>标签核对结论（核对对象：{_esc(checked)}）</h2>
 <p>标签声明的过敏原：{declared}</p>
@@ -220,7 +239,15 @@ def render_markdown_report(review: dict) -> str:
         f"# 食品过敏原标签审查报告\n",
         f"- 审查名称：{review['name']}",
         f"- 报告编号：#{review['id']}",
-        f"- 生成时间：{review['created_at']}\n",
+        f"- 生成时间：{review['created_at']}",
+    ]
+    if review.get("dict_fingerprint"):
+        parts.append(f"- 字典指纹：`{review['dict_fingerprint']}`")
+    if review.get("rechecked_at"):
+        parts.append(f"- 最近复核：{review['rechecked_at']}")
+    if review.get("needs_review"):
+        parts.append("- ⚠ **需复核**：该记录基于旧版字典生成，涉及原料映射已变化")
+    parts += [
         f"## 标签核对结论（核对对象：{checked}）\n",
         f"- 标签声明：{fmt(review['declared'])}",
         *_missing_md(check),

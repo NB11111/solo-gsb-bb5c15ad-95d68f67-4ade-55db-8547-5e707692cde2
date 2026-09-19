@@ -18,9 +18,8 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from . import db
-from .analysis import (attach_allergens, collect_allergens, compare_label,
-                       diff_allergens, diff_ingredients, flatten)
-from .parser import parse_recipe
+from .recheck import (build_result, diff_results, reparse_review,
+                      scoped_fingerprint, involved_keys)
 from .report import render_html_report, render_markdown_report
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,46 +104,12 @@ def bulk_import(payload: BulkImport):
 
 # ---------- 审查 ----------
 
-def _build_version(tree) -> dict:
-    return {
-        "tree": [node.to_dict() for node in tree],
-        "allergens": sorted(collect_allergens(tree)),
-        "unknown_ingredients": sorted({n.name for n in flatten(tree) if n.unknown}),
-    }
-
-
 def _build_result(payload: ReviewCreate) -> dict:
-    dictionary = db.dict_lookup()
-
-    tree_a = parse_recipe(payload.text_a)
-    attach_allergens(tree_a, dictionary)
-    version_a = _build_version(tree_a)
-
-    result = {
-        "version_a": version_a,
-        "version_b": None,
-        "diff": None,
-        "ingredient_changes": None,
-        # 标签默认对照现版配方；若提供了新版配方，则对照新版
-        "label_check_version": payload.label_a,
-    }
-    check_allergens = version_a["allergens"]
-    checked_tree = version_a["tree"]
-
-    if payload.text_b and payload.text_b.strip():
-        tree_b = parse_recipe(payload.text_b)
-        attach_allergens(tree_b, dictionary)
-        version_b = _build_version(tree_b)
-        result["version_b"] = version_b
-        result["diff"] = diff_allergens(version_a["allergens"], version_b["allergens"])
-        result["ingredient_changes"] = diff_ingredients(tree_a, tree_b)
-        result["label_check_version"] = payload.label_b
-        check_allergens = version_b["allergens"]
-        checked_tree = version_b["tree"]
-
-    result["label_check"] = compare_label(
-        check_allergens, payload.declared, checked_tree)
-    return result
+    return build_result(
+        text_a=payload.text_a,
+        text_b=payload.text_b if payload.text_b and payload.text_b.strip() else None,
+        label_a=payload.label_a, label_b=payload.label_b,
+        declared=payload.declared, dictionary=db.dict_lookup())
 
 
 @app.post("/api/reviews", status_code=201)
@@ -152,12 +117,15 @@ def create_review(payload: ReviewCreate):
     if not payload.text_a.strip():
         raise HTTPException(400, "配方文本不能为空")
     result = _build_result(payload)
+    # 保存本次审查实际使用的字典在“配方涉及原料”上的稳定指纹
+    fingerprint = scoped_fingerprint(
+        db.dict_lookup(), involved_keys(payload.text_a, payload.text_b))
     rid = db.create_review(
         name=payload.name.strip() or "未命名审查",
         declared=sorted(set(payload.declared)),
         text_a=payload.text_a, text_b=payload.text_b,
         label_a=payload.label_a, label_b=payload.label_b,
-        result=result,
+        result=result, dict_fingerprint=fingerprint,
     )
     return {"id": rid, **result}
 
@@ -181,6 +149,49 @@ def remove_review(rid: int):
         raise HTTPException(404, "审查记录不存在")
     db.delete_review(rid)
     return {"ok": True}
+
+
+# ---------- 字典时效复核 ----------
+
+def _reparse(review: dict) -> tuple[dict, str]:
+    """按当前字典重新解析原始 A/B 配方与标签声明，返回 (新结果, 新指纹)。"""
+    dictionary = db.dict_lookup()
+    new_result = reparse_review(review, dictionary)
+    fingerprint = scoped_fingerprint(
+        dictionary, involved_keys(review["text_a"], review["text_b"]))
+    return new_result, fingerprint
+
+
+@app.get("/api/reviews/{rid}/recheck")
+def preview_recheck(rid: int):
+    """一键复核（预览）：用当前字典重算，并先返回遗漏/多报/来源路径的前后差异。"""
+    review = db.get_review(rid)
+    if not review:
+        raise HTTPException(404, "审查记录不存在")
+    new_result, fingerprint = _reparse(review)
+    diff = diff_results(review["result"], new_result)
+    return {
+        "id": rid,
+        "needs_review": review["needs_review"],
+        "legacy": review["legacy"],
+        "old_fingerprint": review["dict_fingerprint"],
+        "new_fingerprint": fingerprint,
+        "diff": diff,
+        "new_result": new_result,
+    }
+
+
+@app.post("/api/reviews/{rid}/recheck", status_code=200)
+def confirm_recheck(rid: int):
+    """确认复核：以当前字典重算的结果覆盖旧结果，并更新指纹与复核时间。"""
+    review = db.get_review(rid)
+    if not review:
+        raise HTTPException(404, "审查记录不存在")
+    # 始终按当前字典重算，不采信前端回传的预览结果，确保覆盖内容可追溯
+    new_result, fingerprint = _reparse(review)
+    db.update_review_result(rid, new_result, fingerprint)
+    updated = db.get_review(rid)
+    return {"id": rid, **updated}
 
 
 @app.get("/api/reviews/{rid}/report")
