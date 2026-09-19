@@ -1,0 +1,109 @@
+# 食品过敏原标签审查台
+
+基于 **FastAPI + SQLite** 的食品过敏原标签审查工具：在浏览器中录入带嵌套子配料的配方文本和原料过敏原字典，系统自动解析括号层级、沿配料树传播并汇总每种原料的过敏原集合，与标签声明比对指出**遗漏 / 多报**的过敏原；支持录入**两版配方**查看过敏原变化，并可一键导出标签审查报告（HTML / Markdown）。
+
+## 功能一览
+
+- 🌳 **嵌套配方解析**：`巧克力酱（可可脂，奶粉（乳清粉，乳糖））` 多层括号任意嵌套，中英文括号均可
+- 🧬 **过敏原传播**：子配料的过敏原自动向上传播到父级配料，逐层汇总
+- 🔎 **遗漏来源追踪**：每个遗漏过敏原保留其在嵌套配料树中的全部来源路径（如 `巧克力酱 › 奶粉 › 乳清粉`），同名原料出现在不同分支时路径分别保留、稳定去重排序；结果页可逐项展开，HTML / Markdown 报告同步输出，升级前的历史记录重新打开时也会自动补齐
+- ✅ **标签核对**：对照标签声明的过敏原，标出「遗漏（必须补充）」「多报」「一致」
+- 🔄 **版本对比**：录入现版 / 新版两版配方，输出新增、减少的过敏原及每种配料的变化
+- 📄 **报告导出**：HTML（可直接打印存档）与 Markdown 两种格式
+- 📚 **字典管理**：原料 → 过敏原字典批量导入、逐条增删，未登记原料自动提示
+- 💾 **持久化**：SQLite 存储字典与全部历史审查记录，可随时回看、重新导出
+
+## 快速开始
+
+### 方式一：Docker Compose（推荐）
+
+```bash
+docker compose up --build
+```
+
+### 方式二：Docker
+
+```bash
+docker build -t allergen-review .
+docker run -d -p 8000:8000 -v $(pwd)/data:/app/data allergen-review
+```
+
+### 方式三：本地运行
+
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+## 端口与访问
+
+| 项目 | 地址 |
+| --- | --- |
+| Web 界面 | <http://localhost:8000> |
+| API 文档（Swagger） | <http://localhost:8000/docs> |
+| 端口 | **8000**（宿主机端口可在 `docker-compose.yml` 的 `ports` 中修改） |
+
+SQLite 数据库文件位于 `./data/app.db`（Compose 已挂载该目录，容器重启数据不丢失）；可用环境变量 `DB_PATH` 覆盖路径。
+
+## 使用说明
+
+1. **导入过敏原字典**：每行一条，格式 `原料名：过敏原1，过敏原2`（冒号、逗号中英文均可），例如：
+
+   ```text
+   小麦粉：麸质谷物
+   乳清粉：乳
+   大豆卵磷脂：大豆
+   可可脂：
+   ```
+
+2. **录入配方**：配料用逗号分隔，括号表示子配料，可多层嵌套；`配料表：` 等前缀会自动去除：
+
+   ```text
+   配料表：小麦粉，白砂糖，巧克力酱（可可脂，奶粉（乳清粉，乳糖），大豆卵磷脂），鸡蛋，食盐
+   ```
+
+3. **勾选标签声明的过敏原**，点击「开始审查」，即可看到：
+   - 标签核对结论（遗漏 / 多报 / 一致）；
+   - 配方解析树，深绿色徽章为原料自身标注，浅色徽章为子配料传播结果；
+   - 填写配方 B 时，额外展示两版过敏原差异与每种配料的变化。
+4. **导出报告**：结果页或历史记录中下载 HTML / Markdown 审查报告。
+
+页面上「填充示例」按钮可一键载入演示字典与两版配方，快速体验完整流程。
+
+## API 摘要
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/dict` | 获取过敏原字典 |
+| POST | `/api/dict` | 新增 / 更新单条字典 |
+| POST | `/api/dict/bulk` | 批量导入字典（`{"text": "..."}`） |
+| DELETE | `/api/dict/{ingredient}` | 删除字典条目 |
+| POST | `/api/reviews` | 创建审查（单版或两版配方 + 标签声明） |
+| GET | `/api/reviews` / `/api/reviews/{id}` | 审查列表 / 详情 |
+| DELETE | `/api/reviews/{id}` | 删除审查记录 |
+| GET | `/api/reviews/{id}/report?format=html\|md` | 导出审查报告 |
+
+## 项目结构
+
+```text
+app/
+├── main.py        # FastAPI 路由与审查流程编排
+├── parser.py      # 嵌套括号配方解析（配料树）
+├── analysis.py    # 过敏原传播、标签核对、版本差异
+├── db.py          # SQLite 持久层（字典 + 审查记录）
+├── report.py      # HTML / Markdown 报告生成
+└── static/
+    └── index.html # 单页 Web 界面
+tests/
+└── test_core.py   # 解析与分析单元测试
+Dockerfile
+docker-compose.yml
+requirements.txt
+```
+
+## 运行测试
+
+```bash
+python -m unittest discover -s tests -v        # 单元测试
+python -m tests.smoke_integration              # 端到端集成冒烟测试
+```
