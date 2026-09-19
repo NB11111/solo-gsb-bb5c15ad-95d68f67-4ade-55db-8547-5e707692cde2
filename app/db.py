@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
 
 from .analysis import missing_allergen_sources, normalize_name
+from .fingerprint import result_keys, scoped_fingerprint
 
 DB_PATH = os.environ.get("DB_PATH") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "data", "app.db"))
@@ -31,7 +32,8 @@ CREATE TABLE IF NOT EXISTS reviews (
     label_a    TEXT NOT NULL DEFAULT '现版配方',
     label_b    TEXT NOT NULL DEFAULT '新版配方',
     result     TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    dict_fingerprint TEXT
 );
 """
 
@@ -50,6 +52,10 @@ def _now() -> str:
 def init_db() -> None:
     with _lock, _connect() as conn:
         conn.executescript(_SCHEMA)
+        # 旧库迁移：为升级前创建的 reviews 表补齐字典指纹列
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(reviews)")}
+        if "dict_fingerprint" not in cols:
+            conn.execute("ALTER TABLE reviews ADD COLUMN dict_fingerprint TEXT")
 
 
 # ---------- 过敏原字典 ----------
@@ -111,17 +117,29 @@ def bulk_import(text: str) -> int:
 
 def create_review(*, name: str, declared: List[str], text_a: str,
                   text_b: Optional[str], label_a: str, label_b: str,
-                  result: dict) -> int:
+                  result: dict, dict_fingerprint: Optional[str] = None) -> int:
     with _lock, _connect() as conn:
         cur = conn.execute(
             "INSERT INTO reviews (name, declared, text_a, text_b, label_a, "
-            "label_b, result, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            "label_b, result, created_at, dict_fingerprint) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (name, json.dumps(declared, ensure_ascii=False), text_a, text_b,
-             label_a, label_b, json.dumps(result, ensure_ascii=False), _now()))
+             label_a, label_b, json.dumps(result, ensure_ascii=False), _now(),
+             dict_fingerprint))
         return cur.lastrowid
 
 
+def update_review_result(rid: int, result: dict,
+                         dict_fingerprint: str) -> None:
+    """字典时效复核确认后：覆盖审查结果并更新字典指纹。"""
+    with _lock, _connect() as conn:
+        conn.execute(
+            "UPDATE reviews SET result = ?, dict_fingerprint = ? WHERE id = ?",
+            (json.dumps(result, ensure_ascii=False), dict_fingerprint, rid))
+
+
 def _row_to_review(row: sqlite.Row) -> dict:
+    keys = row.keys()
     return {
         "id": row["id"],
         "name": row["name"],
@@ -132,7 +150,28 @@ def _row_to_review(row: sqlite.Row) -> dict:
         "label_b": row["label_b"],
         "result": json.loads(row["result"]),
         "created_at": row["created_at"],
+        "dict_fingerprint": (row["dict_fingerprint"]
+                             if "dict_fingerprint" in keys else None),
     }
+
+
+def _recheck_status(r: dict, dictionary: Optional[Dict[str, Set[str]]] = None):
+    """计算记录的字典时效状态。
+
+    返回 (needs_recheck, reason)：
+    - 无指纹（升级前旧记录）→ (True, "legacy")，按需复核；
+    - 以记录结果中 A/B 配料树实际涉及的原料对当前字典重算指纹，
+      与保存值不一致 → (True, "stale")；
+    - 一致 → (False, None)。配方未涉及的原料变化不会影响指纹。
+    """
+    saved = r.get("dict_fingerprint")
+    if not saved:
+        return True, "legacy"
+    dictionary = dict_lookup() if dictionary is None else dictionary
+    current = scoped_fingerprint(result_keys(r.get("result") or {}), dictionary)
+    if current != saved:
+        return True, "stale"
+    return False, None
 
 
 def _backfill_missing_sources(r: dict) -> dict:
@@ -162,22 +201,33 @@ def get_review(rid: int) -> Optional[dict]:
     with _lock, _connect() as conn:
         row = conn.execute("SELECT * FROM reviews WHERE id = ?",
                            (rid,)).fetchone()
-    return _backfill_missing_sources(_row_to_review(row)) if row else None
+    if not row:
+        return None
+    r = _backfill_missing_sources(_row_to_review(row))
+    needs, reason = _recheck_status(r)
+    r["needs_recheck"] = needs
+    r["recheck_reason"] = reason
+    return r
 
 
 def list_reviews() -> List[dict]:
     with _lock, _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM reviews ORDER BY id DESC").fetchall()
+    # 一次取出当前字典供全部记录比对，避免逐条查询
+    dictionary = dict_lookup()
     reviews = []
     for row in rows:
         r = _row_to_review(row)
         check = r["result"].get("label_check", {})
+        needs, reason = _recheck_status(r, dictionary)
         reviews.append({
             "id": r["id"], "name": r["name"], "created_at": r["created_at"],
             "has_two_versions": bool(r["text_b"]),
             "missing_count": len(check.get("missing", [])),
             "over_reported_count": len(check.get("over_reported", [])),
+            "needs_recheck": needs,
+            "recheck_reason": reason,
         })
     return reviews
 

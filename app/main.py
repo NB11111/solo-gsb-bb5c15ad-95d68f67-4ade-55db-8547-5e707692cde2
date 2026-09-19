@@ -18,10 +18,9 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from . import db
-from .analysis import (attach_allergens, collect_allergens, compare_label,
-                       diff_allergens, diff_ingredients, flatten)
-from .parser import parse_recipe
+from .recheck import build_recheck
 from .report import render_html_report, render_markdown_report
+from .review import analyze
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -60,6 +59,11 @@ class ReviewCreate(BaseModel):
     label_a: str = "现版配方"
     label_b: str = "新版配方"
     declared: List[str] = Field(default_factory=list)
+
+
+class RecheckRequest(BaseModel):
+    # false：仅预览前后差异；true：确认后覆盖结果并更新指纹
+    confirm: bool = False
 
 
 # ---------- 页面 ----------
@@ -105,59 +109,21 @@ def bulk_import(payload: BulkImport):
 
 # ---------- 审查 ----------
 
-def _build_version(tree) -> dict:
-    return {
-        "tree": [node.to_dict() for node in tree],
-        "allergens": sorted(collect_allergens(tree)),
-        "unknown_ingredients": sorted({n.name for n in flatten(tree) if n.unknown}),
-    }
-
-
-def _build_result(payload: ReviewCreate) -> dict:
-    dictionary = db.dict_lookup()
-
-    tree_a = parse_recipe(payload.text_a)
-    attach_allergens(tree_a, dictionary)
-    version_a = _build_version(tree_a)
-
-    result = {
-        "version_a": version_a,
-        "version_b": None,
-        "diff": None,
-        "ingredient_changes": None,
-        # 标签默认对照现版配方；若提供了新版配方，则对照新版
-        "label_check_version": payload.label_a,
-    }
-    check_allergens = version_a["allergens"]
-    checked_tree = version_a["tree"]
-
-    if payload.text_b and payload.text_b.strip():
-        tree_b = parse_recipe(payload.text_b)
-        attach_allergens(tree_b, dictionary)
-        version_b = _build_version(tree_b)
-        result["version_b"] = version_b
-        result["diff"] = diff_allergens(version_a["allergens"], version_b["allergens"])
-        result["ingredient_changes"] = diff_ingredients(tree_a, tree_b)
-        result["label_check_version"] = payload.label_b
-        check_allergens = version_b["allergens"]
-        checked_tree = version_b["tree"]
-
-    result["label_check"] = compare_label(
-        check_allergens, payload.declared, checked_tree)
-    return result
-
-
 @app.post("/api/reviews", status_code=201)
 def create_review(payload: ReviewCreate):
     if not payload.text_a.strip():
         raise HTTPException(400, "配方文本不能为空")
-    result = _build_result(payload)
-    rid = db.create_review(
-        name=payload.name.strip() or "未命名审查",
-        declared=sorted(set(payload.declared)),
+    declared = sorted(set(payload.declared))
+    result, fingerprint = analyze(
         text_a=payload.text_a, text_b=payload.text_b,
         label_a=payload.label_a, label_b=payload.label_b,
-        result=result,
+        declared=declared)
+    rid = db.create_review(
+        name=payload.name.strip() or "未命名审查",
+        declared=declared,
+        text_a=payload.text_a, text_b=payload.text_b,
+        label_a=payload.label_a, label_b=payload.label_b,
+        result=result, dict_fingerprint=fingerprint,
     )
     return {"id": rid, **result}
 
@@ -181,6 +147,27 @@ def remove_review(rid: int):
         raise HTTPException(404, "审查记录不存在")
     db.delete_review(rid)
     return {"ok": True}
+
+
+@app.post("/api/reviews/{rid}/recheck")
+def recheck_review(rid: int, payload: RecheckRequest):
+    """字典时效复核。
+
+    始终先用当前字典重新解析记录的原始 A/B 配方与标签声明并计算前后差异；
+    confirm=false 时仅返回差异供页面预览，不改动记录；
+    confirm=true 时确认覆盖结果、刷新字典指纹（含旧记录补录指纹）。
+    """
+    review = db.get_review(rid)
+    if not review:
+        raise HTTPException(404, "审查记录不存在")
+    outcome = build_recheck(review)
+    if payload.confirm:
+        db.update_review_result(
+            rid, outcome["new_result"], outcome["fingerprint"])
+        updated = db.get_review(rid)
+        outcome["review"] = updated
+    outcome["id"] = rid
+    return outcome
 
 
 @app.get("/api/reviews/{rid}/report")

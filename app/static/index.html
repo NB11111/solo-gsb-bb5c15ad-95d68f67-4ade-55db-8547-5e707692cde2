@@ -67,6 +67,21 @@
   ul.src-paths li { list-style: disc; }
   .src-arrow { color: #999; margin: 0 2px; }
   .src-leaf { font-weight: 600; color: var(--red); }
+  .pill.orange { background: #ffedd5; color: var(--orange); }
+  .recheck-bar { border: 1px solid #fdba74; background: #fff7ed;
+                 border-radius: 8px; padding: 10px 14px; margin: 10px 0;
+                 font-size: 13.5px; }
+  .recheck-bar b { color: var(--orange); }
+  .recheck-bar button { margin-left: 10px; padding: 4px 14px; font-size: 13px; }
+  .recheck-panel { border: 1px solid #c9d1d9; border-radius: 8px;
+                   padding: 12px 16px; margin: 10px 0; background: #fafbfc; }
+  .recheck-panel h4 { margin: 10px 0 6px; font-size: 14px; color: #17457a; }
+  .delta-add { color: var(--green); font-weight: 600; }
+  .delta-del { color: var(--red); text-decoration: line-through; }
+  .delta-list { margin: 4px 0; font-size: 13.5px; line-height: 1.9; }
+  .delta-path { margin: 2px 0 2px 18px; font-size: 13px; }
+  .recheck-preview { border-top: 1px dashed #d0d7de; margin-top: 10px;
+                     padding-top: 8px; }
 </style>
 </head>
 <body>
@@ -118,6 +133,8 @@
 
 <section id="result-section" class="hidden">
   <h2>③ 审查结果 <span id="result-title" class="hint"></span></h2>
+  <div id="recheck-bar"></div>
+  <div id="recheck-panel" class="recheck-panel hidden"></div>
   <div id="result-body"></div>
   <div class="toolbar">
     <a id="export-html" class="link" href="#">⬇ 导出 HTML 报告</a>
@@ -194,11 +211,13 @@ async function importBulk() {
   const r = await post('/api/dict/bulk', {text});
   $('dict-msg').textContent = `已导入 ${r.imported} 条`;
   await loadDict();
+  await loadHistory();
 }
 
 async function deleteEntry(name) {
   await api('/api/dict/' + encodeURIComponent(name), {method: 'DELETE'});
   await loadDict();
+  await loadHistory();
 }
 
 /* ---------- 声明过敏原勾选 ---------- */
@@ -238,6 +257,7 @@ async function submitReview() {
     });
     currentReviewId = r.id;
     renderResult(r, {name: $('review-name').value, declared});
+    renderRecheckBar(null);
     await loadHistory();
   } catch (e) {
     $('review-msg').textContent = e.message;
@@ -289,6 +309,13 @@ function missingCell(check) {
 function renderResult(r, meta) {
   $('result-section').classList.remove('hidden');
   $('result-title').textContent = meta && meta.name ? `— ${meta.name}` : '';
+  $('result-body').innerHTML = resultBodyHtml(r, meta);
+  $('export-html').href = `/api/reviews/${currentReviewId}/report?format=html`;
+  $('export-md').href = `/api/reviews/${currentReviewId}/report?format=md`;
+  $('result-section').scrollIntoView({behavior: 'smooth'});
+}
+
+function resultBodyHtml(r, meta) {
   const check = r.label_check;
   let html = `<div class="result-block">
     <h3>标签核对结论（核对对象：${esc(r.label_check_version)}）
@@ -317,10 +344,7 @@ function renderResult(r, meta) {
       ${rows ? `<table><tr><th style="width:30%">配料</th><th>变化</th></tr>${rows}</table>` : '<p class="hint">各配料过敏原无变化。</p>'}
     </div>`;
   }
-  $('result-body').innerHTML = html;
-  $('export-html').href = `/api/reviews/${currentReviewId}/report?format=html`;
-  $('export-md').href = `/api/reviews/${currentReviewId}/report?format=md`;
-  $('result-section').scrollIntoView({behavior: 'smooth'});
+  return html;
 }
 
 /* ---------- 历史 ---------- */
@@ -330,18 +354,29 @@ async function loadHistory() {
     $('history-table').innerHTML = '<p class="hint">暂无记录</p>';
     return;
   }
-  const rows = reviews.map(r => `<tr>
+  const rows = reviews.map(r => {
+    let fresh;
+    if (r.needs_recheck) {
+      const why = r.recheck_reason === 'legacy' ? '旧记录无指纹' : '相关原料映射已变更';
+      fresh = `<span class="pill orange" title="${esc(why)}">需复核</span>
+        <button class="ghost" style="padding:2px 10px;font-size:12px;margin-left:6px"
+          onclick="recheckReview(${r.id})">一键复核</button>`;
+    } else {
+      fresh = '<span class="pill green" title="所用字典与当前字典一致">时效正常</span>';
+    }
+    return `<tr>
     <td>#${r.id}</td>
     <td><a class="link" onclick="viewReview(${r.id})">${esc(r.name)}</a></td>
     <td>${r.has_two_versions ? '两版对比' : '单版'}</td>
     <td>${r.missing_count ? `<span class="pill red">遗漏 ${r.missing_count}</span>` : '<span class="pill green">无遗漏</span>'}
         ${r.over_reported_count ? `<span class="pill gray">多报 ${r.over_reported_count}</span>` : ''}</td>
+    <td>${fresh}</td>
     <td class="hint">${esc(r.created_at)}</td>
     <td><a class="link" href="/api/reviews/${r.id}/report?format=html">报告</a>
         <a class="link" onclick="deleteReview(${r.id})" style="margin-left:8px">删除</a></td>
-  </tr>`).join('');
+  </tr>`;}).join('');
   $('history-table').innerHTML =
-    `<table><tr><th>ID</th><th>名称</th><th>类型</th><th>结论</th><th>时间</th><th>操作</th></tr>${rows}</table>`;
+    `<table><tr><th>ID</th><th>名称</th><th>类型</th><th>结论</th><th>字典时效</th><th>时间</th><th>操作</th></tr>${rows}</table>`;
 }
 
 async function viewReview(id) {
@@ -349,6 +384,154 @@ async function viewReview(id) {
   currentReviewId = id;
   renderResult({...r.result, label_check_version: r.result.label_check_version},
                {name: r.name, declared: r.declared});
+  renderRecheckBar(r);
+}
+
+/* ---------- 字典时效复核 ---------- */
+let currentReviewMeta = null;
+
+function renderRecheckBar(r) {
+  currentReviewMeta = r;
+  const bar = $('recheck-bar');
+  $('recheck-panel').classList.add('hidden');
+  $('recheck-panel').innerHTML = '';
+  if (!r) { bar.innerHTML = ''; return; }
+  if (r.needs_recheck) {
+    const why = r.recheck_reason === 'legacy'
+      ? '该记录创建时未保存字典指纹（旧版本记录），请按需用当前字典复核。'
+      : '该记录涉及原料的过敏原映射自审查后发生变化，历史结论可能已过时。';
+    bar.innerHTML =
+      `<div class="recheck-bar">⚠ <b>需复核：</b>${esc(why)}
+         <button onclick="openRecheck()">一键复核</button></div>`;
+  } else {
+    bar.innerHTML =
+      `<div class="recheck-bar" style="border-color:#86efac;background:#f0fdf4">
+         ✅ <b style="color:var(--green)">字典时效正常：</b>
+         所用过敏原字典与当前字典中本配方涉及原料的映射一致，结论有效。
+       </div>`;
+  }
+}
+
+function deltaLine(label, delta) {
+  const parts = [];
+  if (delta.added.length)
+    parts.push(`<span class="delta-add">+ ${delta.added.map(esc).join('、')}</span>`);
+  if (delta.removed.length)
+    parts.push(`<span class="delta-del">− ${delta.removed.map(esc).join('、')}</span>`);
+  if (!parts.length) return '';
+  return `<div class="delta-list"><b>${esc(label)}：</b>${parts.join('　')}</div>`;
+}
+
+function pathLine(path) {
+  return path.map((part, i) =>
+    `<span${i === path.length - 1 ? ' class="src-leaf"' : ''}>${esc(part)}</span>`
+  ).join('<span class="src-arrow"> › </span>');
+}
+
+function pathChangesHtml(changes) {
+  if (!changes.length) return '';
+  return changes.map(c => {
+    const added = c.paths_added.map(p =>
+      `<div class="delta-path"><span class="delta-add">新增路径</span> ${pathLine(p)}</div>`).join('');
+    const removed = c.paths_removed.map(p =>
+      `<div class="delta-path"><span class="delta-del">消失路径</span> ${pathLine(p)}</div>`).join('');
+    return `<div class="delta-list"><span class="badge miss">${esc(c.allergen)}</span> 来源路径变化：</div>${added}${removed}`;
+  }).join('');
+}
+
+function versionsDiffHtml(versions) {
+  const titles = {version_a: '配方 A', version_b: '配方 B'};
+  let out = '';
+  for (const [key, d] of Object.entries(versions)) {
+    const block = deltaLine(`${titles[key] || key} 过敏原全集`, d.allergens)
+      + deltaLine(`${titles[key] || key} 未识别原料`, d.unknown_ingredients);
+    if (block) out += `<h4>${esc(titles[key] || key)} 变化</h4>${block}`;
+  }
+  return out;
+}
+
+async function recheckReview(id) {
+  await viewReview(id);
+  $('result-section').scrollIntoView({behavior: 'smooth'});
+  await openRecheck();
+}
+
+async function openRecheck() {
+  if (!currentReviewId) return;
+  const panel = $('recheck-panel');
+  panel.classList.remove('hidden');
+  panel.innerHTML = '<p class="hint">正在用当前字典重新解析原始配方…</p>';
+  try {
+    const r = await post(`/api/reviews/${currentReviewId}/recheck`, {confirm: false});
+    renderRecheckPreview(r);
+  } catch (e) {
+    panel.innerHTML = `<p class="error">复核失败：${esc(e.message)}</p>`;
+  }
+}
+
+function renderRecheckPreview(r) {
+  const d = r.diff, label = d.label, versions = d.versions;
+  let body = '';
+  if (!r.changed) {
+    body = `<p>✅ 当前字典重新解析后，<b>遗漏 / 多报、来源路径及各版过敏原均无变化</b>，
+              历史结论仍然成立。确认仅会刷新字典指纹（旧记录也由此补上指纹）。</p>`;
+  } else {
+    body += '<h4>标签核对差异（核对对象：'
+      + esc(label.label_check_version.before) + '）</h4>';
+    body += deltaLine('遗漏（新增 / 消失）', label.missing_delta);
+    body += deltaLine('多报（新增 / 消失）', label.over_reported_delta);
+    body += deltaLine('声明一致（新增 / 移出）', label.matched_delta);
+    body += pathChangesHtml(label.path_changes);
+    body += versionsDiffHtml(versions);
+    body += '<div class="recheck-preview"><p class="hint">下方结果区可切换查看「按当前字典复核后」的完整结论。</p>'
+      + '<div class="toolbar">'
+      + '<button class="ghost" onclick="showRecheckPreview()">查看复核后结果</button>'
+      + '<button class="ghost" onclick="showSavedResult()">查看当前保存结果</button>'
+      + '</div><div id="recheck-preview-body"></div></div>';
+  }
+  $('recheck-panel').innerHTML =
+    `<h3>字典时效复核（记录 #${esc(String(r.id))}）</h3>${body}
+     <div class="toolbar">
+       <button onclick="confirmRecheck()">确认并覆盖结果</button>
+       <button class="secondary" onclick="cancelRecheck()">取消</button>
+     </div>`;
+  if (r.changed) window.__recheckNewResult = r.new_result;
+}
+
+function showRecheckPreview() {
+  const newResult = window.__recheckNewResult;
+  const meta = currentReviewMeta || {};
+  $('recheck-preview-body').innerHTML =
+    '<div class="recheck-preview">'
+    + resultBodyHtml({...newResult, label_check_version: newResult.label_check_version},
+                     {name: (meta.name || '') + '（复核后预览）', declared: meta.declared || []})
+    + '</div>';
+  $('recheck-preview-body').classList.remove('hidden');
+}
+
+function showSavedResult() {
+  $('recheck-preview-body').innerHTML = '';
+}
+
+async function confirmRecheck() {
+  try {
+    const r = await post(`/api/reviews/${currentReviewId}/recheck`, {confirm: true});
+    const review = r.review;
+    $('recheck-panel').classList.add('hidden');
+    $('recheck-panel').innerHTML = '';
+    renderResult({...review.result, label_check_version: review.result.label_check_version},
+                 {name: review.name, declared: review.declared});
+    renderRecheckBar(review);
+    await loadHistory();
+  } catch (e) {
+    alert('复核确认失败：' + e.message);
+  }
+}
+
+function cancelRecheck() {
+  const panel = $('recheck-panel');
+  panel.classList.add('hidden');
+  panel.innerHTML = '';
 }
 
 async function deleteReview(id) {

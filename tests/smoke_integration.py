@@ -7,6 +7,7 @@ os.environ["DB_PATH"] = os.path.join(tempfile.mkdtemp(), "smoke.db")
 from app import db
 from app.analysis import (attach_allergens, collect_allergens, compare_label,
                           diff_allergens, diff_ingredients, flatten)
+from app.fingerprint import result_keys, scoped_fingerprint
 from app.parser import parse_recipe
 from app.report import render_html_report, render_markdown_report
 
@@ -97,7 +98,9 @@ result = {
 }
 rid = db.create_review(name="巧克力饼干 配方变更审查", declared=DECLARED,
                        text_a=TEXT_A, text_b=TEXT_B,
-                       label_a="现版配方", label_b="新版配方", result=result)
+                       label_a="现版配方", label_b="新版配方", result=result,
+                       dict_fingerprint=scoped_fingerprint(
+                           result_keys(result), dictionary))
 review = db.get_review(rid)
 html_report = render_html_report(review)
 md_report = render_markdown_report(review)
@@ -119,4 +122,55 @@ old_review = db.get_review(old_rid)
 assert old_review["result"]["label_check"]["missing_sources"]["坚果"] == \
     [["巧克力酱", "椰子粉"]]
 print(f"5. 审查记录入库 (#{rid}) 与 HTML/Markdown 报告导出 OK；旧记录回填 OK")
+
+# 6. 字典时效复核
+from app.recheck import build_recheck
+
+# 6a. 刚创建的记录指纹与当前字典一致，时效正常
+assert db.get_review(rid)["needs_recheck"] is False
+
+# 6b. 无关原料增删 / 顺序变化 / 同值重导不得误报
+db.upsert_entry("无关原料", ["芥末"])
+assert db.get_review(rid)["needs_recheck"] is False
+db.delete_entry("无关原料")
+db.bulk_import("\n".join(reversed("""\
+小麦粉：麸质谷物
+乳清粉：乳
+乳糖：乳
+奶粉：乳
+可可脂：
+大豆卵磷脂：大豆
+鸡蛋：蛋类
+椰子粉：坚果
+芝麻：芝麻
+食盐：
+""".strip().splitlines())))
+assert db.get_review(rid)["needs_recheck"] is False, "顺序/无关变化不得误报"
+
+# 6c. 配方实际涉及原料的映射变化 -> 需复核（两版取并集，椰子粉仅在 B 版）
+db.upsert_entry("椰子粉", ["坚果", "大豆"])
+stale = db.get_review(rid)
+assert stale["needs_recheck"] and stale["recheck_reason"] == "stale"
+outcome = build_recheck(stale)
+assert outcome["changed"]
+# B 版（核对对象）新增遗漏“大豆”，来源路径为 巧克力酱 › 椰子粉
+assert "大豆" in outcome["diff"]["label"]["missing_delta"]["added"]
+assert ["巧克力酱", "椰子粉"] in \
+    outcome["new_result"]["label_check"]["missing_sources"]["大豆"]
+
+# 6d. 确认复核 -> 覆盖结果、刷新指纹、恢复时效正常
+db.update_review_result(rid, outcome["new_result"], outcome["fingerprint"])
+assert db.get_review(rid)["needs_recheck"] is False
+# 复核后报告可继续导出，且包含新结论
+assert "大豆" in render_markdown_report(db.get_review(rid))
+
+# 6e. 升级前旧记录无指纹 -> 按需复核；复核确认后补上指纹
+assert db.get_review(old_rid)["needs_recheck"] is True
+assert db.get_review(old_rid)["recheck_reason"] == "legacy"
+legacy_outcome = build_recheck(db.get_review(old_rid))
+db.update_review_result(old_rid, legacy_outcome["new_result"],
+                        legacy_outcome["fingerprint"])
+assert db.get_review(old_rid)["needs_recheck"] is False
+print("6. 字典时效复核（指纹/误报防护/前后差异/确认覆盖/旧记录） OK")
+
 print("\n全部集成冒烟测试通过 ✔")
